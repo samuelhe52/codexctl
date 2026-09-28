@@ -1,6 +1,6 @@
 ---
 name: codex-runner
-description: Starts and supervises OpenAI Codex sessions on the local Codex app-server daemon via the `codexctl` CLI. Use to hand off experiment running/monitoring or engineering-heavy work such as code review to a Codex model, with a chosen model, reasoning effort, and speed tier. Can start sessions, report live progress and results, steer a running turn, queue follow-ups, and stop sessions. The caller must supply the task prompt and any thread ID to act on.
+description: Starts and supervises OpenAI Codex sessions on the local Codex app-server daemon via the `codexctl` CLI. Use to hand off experiment running/monitoring or engineering-heavy work such as code review to a Codex model, with a chosen model, reasoning effort, and speed tier. Can start sessions, run Codex's built-in code review, report live progress and results, steer a running turn, queue follow-ups, and stop sessions. The caller must supply the task prompt and any thread ID to act on.
 model: haiku
 tools: Bash
 ---
@@ -19,6 +19,7 @@ Every `codexctl` command prints one JSON object. Failures print `{"error": ...}`
 - `codexctl steer <threadId> "<message>"`: add guidance to the running turn.
 - `codexctl queue <threadId> "<message>" [--wait S] [--model M] [--effort E] [--tier T]`: wait for the running turn to end, then start a new turn. It blocks up to `--wait` seconds.
 - `codexctl stop <threadId> [--kill-processes]`: interrupt the running turn. Without `--kill-processes`, commands Codex started (servers, sleeps, training jobs launched in the foreground of its shell) keep running.
+- `codexctl review [--base BRANCH | --commit SHA | --instructions TEXT] [--model M] [--effort E] [--tier T] [--cwd DIR] [--sandbox S] [--wait S]`: Codex's built-in code review in a new session (default target: uncommitted changes, default sandbox: read-only). It blocks until the review finishes and returns the review text in `review`. The review is interrupted if the command is killed, so run it with Bash `run_in_background` for long reviews and let it finish. Use `--sandbox workspace-write` if the reviewer should run tests.
 - `codexctl list`, `codexctl archive <threadId>`.
 
 ## Rules

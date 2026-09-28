@@ -35,7 +35,10 @@ codexctl queue <threadId> "Now write the fix"     # waits for the running turn, 
 codexctl stop <threadId> --kill-processes
 codexctl list
 codexctl archive <threadId>
+codexctl review --base main --model gpt-6-sol --effort high   # built-in review; waits and prints it
 ```
+
+`review` runs Codex's built-in code reviewer in a new session. The target is uncommitted changes by default, or pass one of `--base BRANCH`, `--commit SHA`, or `--instructions TEXT`. It accepts the same model, effort, tier, cwd, name, sandbox, and `-c` options as `start`, but its sandbox defaults to `read-only`. Unlike `start`, it waits for the review and prints the review text, up to `--wait` seconds (default 3600). The daemon interrupts a review as soon as its client disconnects, so run long reviews in the background instead of killing `codexctl`. Under `read-only`, the reviewer can't run tools that need a writable temp directory, such as most test suites. Pass `--sandbox workspace-write` if the review should run tests.
 
 `start` options:
 

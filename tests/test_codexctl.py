@@ -31,6 +31,7 @@ class FakeDaemon:
     def __init__(self, handler):
         self.handler = handler
         self.requests = []
+        self.lock = threading.Lock()
         self.dir = tempfile.mkdtemp()
         self.path = os.path.join(self.dir, "d.sock")
         self.srv = socket.socket(socket.AF_UNIX)
@@ -68,7 +69,17 @@ class FakeDaemon:
             self.requests.append(msg)
             if "id" in msg:
                 for chunk in self.handler(msg):
-                    conn.sendall(chunk)
+                    if isinstance(chunk, tuple):
+                        delay, data, on_sent = chunk
+                        threading.Timer(delay, self._send_later, (conn, data, on_sent)).start()
+                    else:
+                        with self.lock:
+                            conn.sendall(chunk)
+
+    def _send_later(self, conn, data, on_sent):
+        on_sent()
+        with self.lock:
+            conn.sendall(data)
 
     def close(self):
         self.srv.close()
@@ -155,6 +166,43 @@ class OverridePersistenceTest(unittest.TestCase):
             start = next(r for r in d.requests if r.get("method") == "thread/start")
             self.assertEqual(start["params"]["sandbox"], "danger-full-access")
             self.assertEqual(start["params"]["approvalPolicy"], "never")
+
+
+class ReviewTest(unittest.TestCase):
+    def test_review_stays_connected_until_its_turn_completes(self):
+        done = threading.Event()
+
+        def notify(method, params):
+            return server_frame(0x1, json.dumps({"method": method, "params": params}).encode())
+
+        def handler(msg):
+            m = msg["method"]
+            if m == "thread/start":
+                yield reply(msg, {"thread": {"id": "t1"}, "model": "m"})
+            elif m == "review/start":
+                yield reply(msg, {"reviewThreadId": "t1", "turn": {"id": "r1"}})
+                yield notify("turn/completed", {"threadId": "t1", "turn": {"id": "inner", "status": "completed"}})
+                yield (0.3, notify("turn/completed", {"threadId": "t1", "turn": {"id": "r1", "status": "completed"}}),
+                       lambda: done.set())
+            elif m == "thread/turns/list":
+                items = [{"type": "exitedReviewMode"}, {"type": "agentMessage", "text": "no findings"}]
+                yield reply(msg, {"data": [{"id": "r1", "status": "completed" if done.is_set() else "inProgress",
+                                            "items": items if done.is_set() else []}]})
+            else:
+                yield reply(msg, {})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["XDG_STATE_HOME"] = tmp
+            d = FakeDaemon(handler)
+            out = FramingTest().run_cli(d, "review", "--base", "main", "--effort", "high", "--wait", "5")
+            d.close()
+        self.assertTrue(out["finished"])
+        self.assertEqual(out["review"], "no findings")
+        start = next(r for r in d.requests if r.get("method") == "thread/start")
+        self.assertEqual(start["params"]["sandbox"], "read-only")
+        self.assertEqual(start["params"]["config"], {"model_reasoning_effort": "high"})
+        review = next(r for r in d.requests if r.get("method") == "review/start")
+        self.assertEqual(review["params"]["target"], {"type": "baseBranch", "branch": "main"})
 
 
 if __name__ == "__main__":

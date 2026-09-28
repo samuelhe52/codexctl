@@ -213,35 +213,71 @@ def turn_overrides(a):
     return tp
 
 
-def cmd_start(a):
-    c = Client()
+def new_thread(c, a, extra_config=None):
     params = {"approvalPolicy": "never", "sandbox": a.sandbox, "cwd": os.path.abspath(a.cwd)}
     if a.model:
         params["model"] = a.model
     if a.tier:
         params["serviceTier"] = a.tier
-    if a.config:
-        overrides = {}
-        for kv in a.config:
-            if "=" not in kv:
-                raise CodexError(f"-c expects key=value, got {kv!r}")
-            k, v = kv.split("=", 1)
-            overrides[k] = parse_value(v)
+    overrides = dict(extra_config or {})
+    for kv in a.config or []:
+        if "=" not in kv:
+            raise CodexError(f"-c expects key=value, got {kv!r}")
+        k, v = kv.split("=", 1)
+        overrides[k] = parse_value(v)
+    if overrides:
         params["config"] = overrides
     r = c.call("thread/start", params)
     tid = r["thread"]["id"]
-    if a.config:
-        save_overrides(tid, params["config"])
+    if overrides:
+        save_overrides(tid, overrides)
     if a.name:
         c.call("thread/name/set", {"threadId": tid, "name": a.name})
+    return r, tid
+
+
+def thread_info(r, tid, effort):
+    return {"threadId": tid, "model": r.get("model"), "effort": effort or r.get("reasoningEffort"),
+            "serviceTier": r.get("serviceTier"), "sandbox": r.get("sandbox"),
+            "approvalPolicy": r.get("approvalPolicy"), "cwd": r.get("cwd")}
+
+
+def cmd_review(a):
+    if a.base:
+        target = {"type": "baseBranch", "branch": a.base}
+    elif a.commit:
+        target = {"type": "commit", "sha": a.commit}
+    elif a.instructions:
+        target = {"type": "custom", "instructions": a.instructions}
+    else:
+        target = {"type": "uncommittedChanges"}
+    c = Client()
+    # review/start has no effort parameter, so effort is set on the thread's config.
+    r, tid = new_thread(c, a, {"model_reasoning_effort": a.effort} if a.effort else None)
+    rr = c.call("review/start", {"threadId": tid, "target": target})
+    turn_id = rr["turn"]["id"]
+    # The daemon interrupts an inline review as soon as its client disconnects, so stay connected.
+    events, done = stream(c, tid, a.wait, 400, turn_id)
+    out = {**thread_info(r, tid, a.effort), "turnId": turn_id, "target": target, "finished": done}
+    if not done:
+        out["note"] = f"review did not finish within {a.wait}s and was interrupted when codexctl exited"
+        return out
+    turn = latest_turns(c, tid, 1)[-1]
+    msgs = [i.get("text") for i in turn.get("items") or [] if i.get("type") == "agentMessage"]
+    errors = [e for e in events if e["event"] in ("error", "serverRequest")]
+    return {**out, "turnStatus": turn.get("status"), "review": msgs[-1] if msgs else None,
+            **({"errors": errors} if errors else {})}
+
+
+def cmd_start(a):
+    c = Client()
+    r, tid = new_thread(c, a)
     prompt = sys.stdin.read() if a.prompt == "-" else a.prompt
     tp = {"threadId": tid, "input": text_input(prompt), **turn_overrides(a)}
     if a.summary:
         tp["summary"] = a.summary
     tr = c.call("turn/start", tp)
-    return {"threadId": tid, "turnId": tr["turn"]["id"], "model": r.get("model"),
-            "effort": a.effort or r.get("reasoningEffort"), "serviceTier": r.get("serviceTier"),
-            "sandbox": r.get("sandbox"), "approvalPolicy": r.get("approvalPolicy"), "cwd": r.get("cwd")}
+    return {**thread_info(r, tid, a.effort), "turnId": tr["turn"]["id"]}
 
 
 def cmd_status(a):
@@ -302,33 +338,39 @@ def event_of(m, thread_id, limit):
     return None
 
 
-def cmd_watch(a):
-    c = Client()
-    th = read_thread(c, a.thread)
-    resume(c, a.thread)
-    active = active_turn_id(c, a.thread)
-    events, done = [], False
-    if active is None and not a.wait_start:
-        return {"threadId": a.thread, "activeTurnId": None, "finished": True, "events": [],
-                "note": "no active turn; see `status` or `result`"}
-    deadline = time.time() + a.seconds
+def stream(c, thread_id, seconds, chars, turn_id=None):
+    """Collect events until the (given) turn completes or `seconds` pass."""
+    deadline = time.time() + seconds
     backlog, c.pending = c.pending, []
-    while not done:
+    events = []
+    while True:
         if backlog:
             m = backlog.pop(0)
         else:
             remaining = deadline - time.time()
             if remaining <= 0:
-                break
+                return events, False
             c.s.settimeout(remaining)
             try:
                 m = c.read_message()
             except (socket.timeout, TimeoutError):
-                break
-        ev = event_of(m, a.thread, a.chars)
+                return events, False
+        ev = event_of(m, thread_id, chars)
         if ev:
             events.append(ev)
-            done = ev["event"] == "turnCompleted"
+            if ev["event"] == "turnCompleted" and turn_id in (None, ev["turnId"]):
+                return events, True
+
+
+def cmd_watch(a):
+    c = Client()
+    th = read_thread(c, a.thread)
+    resume(c, a.thread)
+    active = active_turn_id(c, a.thread)
+    if active is None and not a.wait_start:
+        return {"threadId": a.thread, "activeTurnId": None, "finished": True, "events": [],
+                "note": "no active turn; see `status` or `result`"}
+    events, done = stream(c, a.thread, a.seconds, a.chars)
     return {"threadId": a.thread, "name": th.get("name"), "finished": done,
             "activeTurnId": None if done else active_turn_id(c, a.thread),
             "droppedEvents": max(0, len(events) - a.max_events), "events": events[-a.max_events:]}
@@ -409,16 +451,29 @@ def build_parser():
         s.add_argument("--effort", help="reasoning effort, see `models`")
         s.add_argument("--tier", help="service tier: `priority` (Fast) or `default`")
 
+    def add_thread_flags(s, sandbox):
+        add_turn_flags(s)
+        s.add_argument("--cwd", default=os.getcwd(), help="working directory (default: current)")
+        s.add_argument("--name", help="thread name shown in Codex history")
+        s.add_argument("--sandbox", default=sandbox, choices=SANDBOXES,
+                       help=f"default: {sandbox} (approvals are always `never`)")
+        s.add_argument("-c", "--config", action="append", metavar="KEY=VALUE",
+                       help="Codex config override, dotted keys allowed; VALUE is parsed as JSON, else string")
+
     s = add("start", cmd_start, "start a new session and its first turn; returns immediately")
     s.add_argument("prompt", help="prompt text, or - to read it from stdin")
-    add_turn_flags(s)
+    add_thread_flags(s, "danger-full-access")
     s.add_argument("--summary", help="reasoning summary mode, e.g. auto, concise, detailed, none")
-    s.add_argument("--cwd", default=os.getcwd(), help="working directory (default: current)")
-    s.add_argument("--name", help="thread name shown in Codex history")
-    s.add_argument("--sandbox", default="danger-full-access", choices=SANDBOXES,
-                   help="default: danger-full-access (approvals are always `never`)")
-    s.add_argument("-c", "--config", action="append", metavar="KEY=VALUE",
-                   help="Codex config override, dotted keys allowed; VALUE is parsed as JSON, else string")
+
+    s = add("review", cmd_review,
+            "run Codex's built-in code review in a new session and wait for the result "
+            "(default target: uncommitted changes); the review is interrupted if codexctl exits early")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--base", metavar="BRANCH", help="review the current branch against BRANCH")
+    g.add_argument("--commit", metavar="SHA", help="review the changes introduced by one commit")
+    g.add_argument("--instructions", help="custom review instructions")
+    s.add_argument("--wait", type=int, default=3600, help="max seconds to wait for the review (default 3600)")
+    add_thread_flags(s, "read-only")
 
     s = add("status", cmd_status, "thread state and the latest persisted items")
     s.add_argument("thread")
