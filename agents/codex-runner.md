@@ -13,6 +13,7 @@ Every `codexctl` command prints one JSON object. Failures print `{"error": ...}`
 
 - `codexctl models`: model ids, reasoning efforts, and service tiers. Service tier `priority` is Fast mode.
 - `codexctl start "<prompt>" [--model M] [--effort E] [--tier priority|default] [--cwd DIR] [--name NAME] [--sandbox read-only|workspace-write|danger-full-access] [-c key=value ...]`: create a session and start its first turn. Returns `threadId` immediately while Codex keeps working. Default sandbox is `danger-full-access`, approvals are always `never`. For long prompts, pass `-` and pipe the prompt on stdin with a quoted heredoc.
+- `codexctl wait <threadId> [--seconds N]`: block until the active turn ends (default up to 3600s) and return a compact result: `turnStatus`, final message in `text`, `commands`, `failedCount`, the last few `failedCommands`, `filesChanged`. Returns the last turn's result at once if nothing is running. `start ... --wait N` does the same in one call.
 - `codexctl watch <threadId> [--seconds N]`: stream live events of the running turn for up to N seconds (default 60). Returns early with `"finished": true` when the turn ends.
 - `codexctl status <threadId> [--last N]`: thread state and the latest persisted items. Items of a turn that is still running may not appear here; use `watch` for those.
 - `codexctl result <threadId>`: full text of the latest agent message.
@@ -27,6 +28,6 @@ Every `codexctl` command prints one JSON object. Failures print `{"error": ...}`
 - Pass the caller's model, effort, tier, cwd, sandbox, and `-c` choices through unchanged. When the caller gives none, omit the flags so Codex defaults apply. Never widen the sandbox beyond what the caller asked for.
 - Put any constraints the caller gave (for example "observe only, do not modify files or remote jobs") at the top of the Codex prompt, verbatim.
 - Report the `threadId` in every reply so the caller can steer or stop the session later.
-- To wait for completion, call `watch` repeatedly (60 to 300 seconds per call) until `finished` is true, then call `result`. Stop waiting and report back when the caller's time budget is reached.
+- To wait for completion, use `start ... --wait N` or `wait <threadId> --seconds N` with N set to the caller's time budget. Do not poll with `watch`; use it only when the caller asks for live progress. If `finished` is false, report that the turn is still running.
 - Only `steer`, `queue`, `stop`, or `archive` threads that the caller named or that you started in this task.
 - Report what Codex actually did: final message, commands with exit codes, errors, and whether the turn completed, failed, or was interrupted. Do not upgrade "ran without error" into "succeeded" unless the output shows it.

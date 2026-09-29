@@ -205,5 +205,80 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(review["params"]["target"], {"type": "baseBranch", "branch": "main"})
 
 
+class WaitTest(unittest.TestCase):
+    def notify(self, method, params):
+        return server_frame(0x1, json.dumps({"method": method, "params": params}).encode())
+
+    def daemon(self, done, active_on_wait=False, complete=True):
+        items = [{"type": "commandExecution", "command": "ls", "exitCode": 0, "aggregatedOutput": "a"},
+                 {"type": "commandExecution", "command": "pytest", "exitCode": 1, "aggregatedOutput": "x" * 5000},
+                 {"type": "fileChange", "status": "completed", "changes": [{"path": "b.py"}, {"path": "a.py"}]},
+                 {"type": "agentMessage", "text": "interim"}, {"type": "agentMessage", "text": "done: 1 failure"}]
+
+        def handler(msg):
+            m = msg["method"]
+            if m == "thread/start":
+                yield reply(msg, {"thread": {"id": "t1"}, "model": "m"})
+            elif m in ("turn/start", "thread/resume"):
+                if m == "turn/start":
+                    yield reply(msg, {"turn": {"id": "u1"}})
+                else:
+                    yield reply(msg, {})
+                if complete and (m == "turn/start" or active_on_wait):
+                    yield (0.2, self.notify("turn/completed", {"threadId": "t1", "turn": {"id": "u1", "status": "completed"}}),
+                           lambda: done.set())
+            elif m == "thread/turns/list":
+                finished = done.is_set() or not active_on_wait
+                yield reply(msg, {"data": [{"id": "u1", "status": "completed" if finished else "inProgress",
+                                            "items": items if finished else []}]})
+            else:
+                yield reply(msg, {})
+        return FakeDaemon(handler)
+
+    def run(self, result=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["XDG_STATE_HOME"] = tmp
+            return super().run(result)
+
+    def check_summary(self, out):
+        self.assertTrue(out["finished"])
+        self.assertEqual(out["turnStatus"], "completed")
+        self.assertEqual(out["text"], "done: 1 failure")
+        self.assertEqual(out["commands"], 2)
+        self.assertEqual([f["command"] for f in out["failedCommands"]], ["pytest"])
+        self.assertEqual(out["failedCount"], 1)
+        self.assertEqual(len(out["failedCommands"][0]["output"]), 500)
+        self.assertEqual(out["filesChanged"], ["a.py", "b.py"])
+
+    def test_start_wait_returns_compact_result_when_turn_ends(self):
+        done = threading.Event()
+        d = self.daemon(done)
+        out = FramingTest().run_cli(d, "start", "go", "--wait", "5")
+        d.close()
+        self.assertEqual(out["threadId"], "t1")
+        self.check_summary(out)
+
+    def test_wait_on_active_turn_blocks_until_it_completes(self):
+        done = threading.Event()
+        d = self.daemon(done, active_on_wait=True)
+        out = FramingTest().run_cli(d, "wait", "t1", "--seconds", "5")
+        d.close()
+        self.assertTrue(done.is_set())
+        self.check_summary(out)
+
+    def test_wait_without_active_turn_returns_last_result(self):
+        d = self.daemon(threading.Event())
+        out = FramingTest().run_cli(d, "wait", "t1")
+        d.close()
+        self.check_summary(out)
+
+    def test_wait_timeout_reports_turn_still_running(self):
+        d = self.daemon(threading.Event(), active_on_wait=True, complete=False)
+        out = FramingTest().run_cli(d, "wait", "t1", "--seconds", "1")
+        d.close()
+        self.assertFalse(out["finished"])
+        self.assertEqual(out["turnId"], "u1")
+
+
 if __name__ == "__main__":
     unittest.main()

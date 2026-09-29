@@ -27,6 +27,8 @@ Each command prints one JSON object. Errors print `{"error": "..."}` and exit wi
 ```sh
 codexctl models                                   # models, efforts, service tiers
 codexctl start "Review the diff in this repo" --model gpt-6-sol --effort high --tier priority --name review
+codexctl start "Run the eval" --model gpt-6-luna --wait 3600   # block, then print a compact result
+codexctl wait <threadId>                          # block until the active turn ends; compact result
 codexctl watch <threadId> --seconds 120           # live events until the turn ends or time runs out
 codexctl status <threadId>                        # thread state and latest persisted items
 codexctl result <threadId>                        # full latest agent message
@@ -40,6 +42,12 @@ codexctl review --base main --model gpt-6-sol --effort high   # built-in review;
 
 `review` runs Codex's built-in code reviewer in a new session. The target is uncommitted changes by default, or pass one of `--base BRANCH`, `--commit SHA`, or `--instructions TEXT`. It accepts the same model, effort, tier, cwd, name, sandbox, and `-c` options as `start`, but its sandbox defaults to `read-only`. Unlike `start`, it waits for the review and prints the review text, up to `--wait` seconds (default 3600). The daemon interrupts a review as soon as its client disconnects, so run long reviews in the background instead of killing `codexctl`. Under `read-only`, the reviewer can't run tools that need a writable temp directory, such as most test suites. Pass `--sandbox workspace-write` if the review should run tests.
 
+`wait` blocks until the thread's active turn ends, then prints a compact result: turn status, the final agent message, the command count, the number of failed commands with the last five of them (output clipped), and the changed files. If no turn is active, it returns that result for the last turn at once. `start --wait SECONDS` does the same right after starting. Unlike `review`, a turn keeps running if `codexctl` exits or times out, so it's safe to run `wait` again.
+
+### Cheap supervision from Claude Code
+
+Waiting doesn't need a model. Run `codexctl start ... --wait 7200` (or `codexctl wait <threadId>`) with Bash `run_in_background`, and Claude Code is notified when it exits. No tokens are spent while Codex works, and only the compact result comes back. Use the `codex-runner` subagent, or `watch` and `steer` directly, only when a run needs mid-course attention.
+
 `start` options:
 
 | Option | Meaning |
@@ -51,6 +59,7 @@ codexctl review --base main --model gpt-6-sol --effort high   # built-in review;
 | `--cwd` | Working directory for the session (default: current directory) |
 | `--name` | Thread name shown in Codex history |
 | `-c KEY=VALUE` | Codex config override; dotted keys work, and `VALUE` is parsed as JSON, falling back to a plain string |
+| `--wait SECONDS` | Block until the turn ends, up to SECONDS, and print the compact result |
 | `-` as prompt | Read the prompt from stdin |
 
 Sessions run on the shared daemon, so they keep running after `codexctl` exits. They also appear in `codex agents` and in Codex history.

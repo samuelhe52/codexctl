@@ -262,11 +262,9 @@ def cmd_review(a):
     if not done:
         out["note"] = f"review did not finish within {a.wait}s and was interrupted when codexctl exited"
         return out
-    turn = latest_turns(c, tid, 1)[-1]
-    msgs = [i.get("text") for i in turn.get("items") or [] if i.get("type") == "agentMessage"]
-    errors = [e for e in events if e["event"] in ("error", "serverRequest")]
-    return {**out, "turnStatus": turn.get("status"), "review": msgs[-1] if msgs else None,
-            **({"errors": errors} if errors else {})}
+    summary = turn_summary(c, tid, turn_id, events)
+    summary["review"] = summary.pop("text")
+    return {**out, **summary}
 
 
 def cmd_start(a):
@@ -277,7 +275,10 @@ def cmd_start(a):
     if a.summary:
         tp["summary"] = a.summary
     tr = c.call("turn/start", tp)
-    return {**thread_info(r, tid, a.effort), "turnId": tr["turn"]["id"]}
+    info = {**thread_info(r, tid, a.effort), "turnId": tr["turn"]["id"]}
+    if a.wait is None:
+        return info
+    return {**info, **wait_turn(c, tid, info["turnId"], a.wait)}
 
 
 def cmd_status(a):
@@ -360,6 +361,50 @@ def stream(c, thread_id, seconds, chars, turn_id=None):
             events.append(ev)
             if ev["event"] == "turnCompleted" and turn_id in (None, ev["turnId"]):
                 return events, True
+
+
+def turn_summary(c, thread_id, turn_id, events, chars=500, max_failed=5):
+    """Compact outcome of a finished turn: final message, failed commands, changed files, errors."""
+    turns = latest_turns(c, thread_id, 3)
+    turn = next((t for t in turns if t["id"] == turn_id), turns[-1] if turns else {})
+    items = turn.get("items") or []
+    msgs = [i.get("text") for i in items if i.get("type") == "agentMessage"]
+    cmds = [i for i in items if i.get("type") == "commandExecution"]
+    failed = [i for i in cmds if i.get("exitCode") not in (None, 0)]
+    files = sorted({ch.get("path") for i in items if i.get("type") == "fileChange" for ch in i.get("changes") or []})
+    errors = [e for e in events if e["event"] in ("error", "serverRequest")]
+    out = {"turnId": turn.get("id"), "turnStatus": turn.get("status"), "text": msgs[-1] if msgs else None,
+           "commands": len(cmds), "failedCount": len(failed),
+           # Exploratory commands often fail harmlessly (grep with no match), so keep only the latest few.
+           "failedCommands": [{"command": clip(i.get("command"), 300), "exitCode": i.get("exitCode"),
+                               "output": clip(i.get("aggregatedOutput"), chars)} for i in failed[-max_failed:]],
+           "filesChanged": files}
+    if turn.get("error"):
+        out["error"] = turn["error"]
+    if errors:
+        out["errors"] = errors
+    return out
+
+
+def wait_turn(c, thread_id, turn_id, seconds):
+    events, done = stream(c, thread_id, seconds, 400, turn_id)
+    if not done:
+        return {"threadId": thread_id, "turnId": turn_id, "finished": False,
+                "note": f"turn still running after {seconds}s; it keeps running. "
+                        f"Run `codexctl wait {thread_id}` again, or `watch` for live events"}
+    return {"threadId": thread_id, "finished": True, **turn_summary(c, thread_id, turn_id, events)}
+
+
+def cmd_wait(a):
+    c = Client()
+    resume(c, a.thread)
+    active = active_turn_id(c, a.thread)
+    if active is None:
+        turns = latest_turns(c, a.thread, 1, items=False)
+        if not turns:
+            return {"threadId": a.thread, "turnId": None, "finished": True, "note": "thread has no turns"}
+        return {"threadId": a.thread, "finished": True, **turn_summary(c, a.thread, turns[-1]["id"], [])}
+    return wait_turn(c, a.thread, active, a.seconds)
 
 
 def cmd_watch(a):
@@ -460,10 +505,13 @@ def build_parser():
         s.add_argument("-c", "--config", action="append", metavar="KEY=VALUE",
                        help="Codex config override, dotted keys allowed; VALUE is parsed as JSON, else string")
 
-    s = add("start", cmd_start, "start a new session and its first turn; returns immediately")
+    s = add("start", cmd_start, "start a new session and its first turn; returns immediately unless --wait")
     s.add_argument("prompt", help="prompt text, or - to read it from stdin")
     add_thread_flags(s, "danger-full-access")
     s.add_argument("--summary", help="reasoning summary mode, e.g. auto, concise, detailed, none")
+    s.add_argument("--wait", type=int, metavar="SECONDS",
+                   help="block until the turn ends (up to SECONDS) and print a compact result; "
+                        "the turn keeps running if codexctl exits first")
 
     s = add("review", cmd_review,
             "run Codex's built-in code review in a new session and wait for the result "
@@ -487,6 +535,12 @@ def build_parser():
     s.add_argument("--max-events", type=int, default=40)
     s.add_argument("--chars", type=int, default=800)
     s.add_argument("--wait-start", action="store_true", help="keep listening even if no turn is active yet")
+
+    s = add("wait", cmd_wait, "block until the active turn ends and print a compact result "
+                              "(final message, failed commands, changed files); returns the last turn's "
+                              "result at once if no turn is active")
+    s.add_argument("thread")
+    s.add_argument("--seconds", type=int, default=3600, help="max seconds to wait (default 3600)")
 
     s = add("result", cmd_result, "full text of the latest agent message")
     s.add_argument("thread")
