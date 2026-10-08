@@ -20,6 +20,17 @@ cd codexctl
 
 The installer symlinks `codexctl` into `~/.local/bin` and `agents/codex-runner.md` into `~/.claude/agents`. Set `CODEXCTL_BIN_DIR` or `CLAUDE_AGENTS_DIR` to change those locations. Restart Claude Code to load the agent.
 
+### Agent skill
+
+The bundled [codexctl skill](skills/codexctl/SKILL.md) teaches agents how to start and supervise sessions, run reviews, and preserve the caller's constraints. To make it available in Codex, link it from this checkout after installing the CLI:
+
+```sh
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+ln -s "$PWD/skills/codexctl" "${CODEX_HOME:-$HOME/.codex}/skills/codexctl"
+```
+
+Run these commands from the repository root, then restart Codex to discover the skill. Other skill-compatible agents can load the same `skills/codexctl` directory. `install.sh` installs the CLI and Claude Code subagent; the skill is installed separately.
+
 ## Usage
 
 Each command prints one JSON object. Errors print `{"error": "..."}` and exit with status 1.

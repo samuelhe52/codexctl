@@ -1,0 +1,4 @@
+interface:
+  display_name: "codexctl"
+  short_description: "Run and supervise local Codex sessions"
+  default_prompt: "Use $codexctl to run the requested task in a Codex session and report its result."
