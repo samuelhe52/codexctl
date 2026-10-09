@@ -143,7 +143,9 @@ class OverridePersistenceTest(unittest.TestCase):
         def handler(msg):
             m = msg["method"]
             if m == "thread/start":
-                yield reply(msg, {"thread": {"id": "t1"}, "model": "m"})
+                yield reply(msg, {"thread": {"id": "t1"}, "model": "m", "sandbox": {"type": "dangerFullAccess"}})
+            elif m == "thread/resume":
+                yield reply(msg, {"sandbox": {"type": "dangerFullAccess"}})
             elif m == "turn/start":
                 yield reply(msg, {"turn": {"id": "u1"}})
             elif m == "thread/read":
@@ -166,6 +168,69 @@ class OverridePersistenceTest(unittest.TestCase):
             start = next(r for r in d.requests if r.get("method") == "thread/start")
             self.assertEqual(start["params"]["sandbox"], "danger-full-access")
             self.assertEqual(start["params"]["approvalPolicy"], "never")
+            self.assertEqual(resumes[0]["params"]["sandbox"], "danger-full-access")
+            self.assertEqual(resumes[0]["params"]["approvalPolicy"], "never")
+            turns = [r["params"] for r in d.requests if r.get("method") == "turn/start"]
+            for tp in turns:
+                self.assertEqual(tp["sandboxPolicy"], {"type": "dangerFullAccess"})
+                self.assertEqual(tp["approvalPolicy"], "never")
+
+
+class PermissionPinningTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["XDG_STATE_HOME"] = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def daemon(self, resume_sandbox, loaded=False):
+        def handler(msg):
+            m = msg["method"]
+            if m == "thread/start":
+                yield reply(msg, {"thread": {"id": "t1"}, "sandbox": {"type": "workspaceWrite", "networkAccess": True}})
+            elif m == "thread/resume":
+                yield reply(msg, {"sandbox": resume_sandbox})
+            elif m == "turn/start":
+                yield reply(msg, {"turn": {"id": "u1"}})
+            elif m == "thread/read":
+                yield reply(msg, {"thread": {"status": {"type": "idle" if loaded else "notLoaded"}}})
+            elif m == "thread/turns/list":
+                yield reply(msg, {"data": []})
+            else:
+                yield reply(msg, {})
+        return FakeDaemon(handler)
+
+    def test_resume_with_wrong_sandbox_fails_closed(self):
+        d = self.daemon({"type": "readOnly"})
+        FramingTest().run_cli(d, "start", "hi", "--sandbox", "workspace-write")
+        out = FramingTest().run_cli(d, "queue", "t1", "again")
+        d.close()
+        self.assertIn("expected 'workspace-write'", out["error"])
+        self.assertEqual(sum(r.get("method") == "turn/start" for r in d.requests), 1)
+
+    def test_queue_resends_exact_policy_from_start(self):
+        d = self.daemon({"type": "workspaceWrite"}, loaded=True)
+        FramingTest().run_cli(d, "start", "hi", "--sandbox", "workspace-write")
+        out = FramingTest().run_cli(d, "queue", "t1", "again")
+        d.close()
+        self.assertEqual(out["sandbox"], "workspace-write")
+        tp = [r["params"] for r in d.requests if r.get("method") == "turn/start"][-1]
+        self.assertEqual(tp["sandboxPolicy"], {"type": "workspaceWrite", "networkAccess": True})
+
+    def test_untracked_thread_is_flagged_and_can_be_pinned(self):
+        d = self.daemon({"type": "dangerFullAccess"})
+        out = FramingTest().run_cli(d, "queue", "other", "go")
+        self.assertIn("no recorded sandbox", out["note"])
+        tp = [r["params"] for r in d.requests if r.get("method") == "turn/start"][-1]
+        self.assertNotIn("sandboxPolicy", tp)
+        out = FramingTest().run_cli(d, "queue", "other", "go", "--sandbox", "danger-full-access")
+        d.close()
+        self.assertNotIn("note", out)
+        resume = [r["params"] for r in d.requests if r.get("method") == "thread/resume"][-1]
+        self.assertEqual(resume["sandbox"], "danger-full-access")
+        tp = [r["params"] for r in d.requests if r.get("method") == "turn/start"][-1]
+        self.assertEqual(tp["sandboxPolicy"], {"type": "dangerFullAccess"})
 
 
 class ReviewTest(unittest.TestCase):

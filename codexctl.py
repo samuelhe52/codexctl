@@ -15,6 +15,9 @@ import time
 
 DEFAULT_SOCK = "~/.codex/app-server-control/app-server-control.sock"
 SANDBOXES = ["read-only", "workspace-write", "danger-full-access"]
+# thread/start and thread/resume take the mode; turn/start and responses use the policy object.
+POLICY_TYPES = {"read-only": "readOnly", "workspace-write": "workspaceWrite",
+                "danger-full-access": "dangerFullAccess"}
 
 
 class CodexError(Exception):
@@ -166,9 +169,9 @@ def load_state():
         return {}
 
 
-def save_overrides(thread_id, overrides):
+def save_thread(thread_id, **fields):
     state = load_state()
-    state[thread_id] = {"config": overrides}
+    state.setdefault(thread_id, {}).update(fields)
     path = state_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.{os.getpid()}.tmp"
@@ -178,12 +181,46 @@ def save_overrides(thread_id, overrides):
 
 
 def resume(c, thread_id):
-    # The daemon keeps model/sandbox/effort/tier across reloads but not `config` overrides.
+    # The daemon keeps model/effort/tier across reloads, but sandbox, approvals, and `config`
+    # overrides fall back to config.toml defaults unless the resume call passes them again.
+    saved = load_state().get(thread_id, {})
     params = {"threadId": thread_id, "excludeTurns": True}
-    saved = load_state().get(thread_id, {}).get("config")
-    if saved:
-        params["config"] = saved
-    c.call("thread/resume", params)
+    if saved.get("config"):
+        params["config"] = saved["config"]
+    if saved.get("sandbox"):
+        params["sandbox"] = saved["sandbox"]
+        params["approvalPolicy"] = saved["approvalPolicy"]
+    r = c.call("thread/resume", params)
+    got = (r.get("sandbox") or {}).get("type")
+    if saved.get("sandbox") and got != POLICY_TYPES[saved["sandbox"]]:
+        raise CodexError(f"thread/resume gave sandbox {got!r}, expected {saved['sandbox']!r}; no turn started")
+
+
+def pinned_permissions(thread_id):
+    """turn/start params that re-assert the thread's recorded sandbox and approvals, if codexctl has them."""
+    saved = load_state().get(thread_id, {})
+    if not saved.get("sandbox"):
+        return {}
+    return {"approvalPolicy": saved["approvalPolicy"],
+            "sandboxPolicy": saved.get("sandboxPolicy") or {"type": POLICY_TYPES[saved["sandbox"]]}}
+
+
+def last_turn_sandbox(path):
+    """Sandbox the latest turn actually ran with, read from the rollout file; None if unavailable."""
+    last = None
+    try:
+        with open(path) as f:
+            for line in f:
+                if '"turn_context"' in line:
+                    e = json.loads(line)
+                    if e.get("type") == "turn_context":
+                        last = e.get("payload", {})
+    except (OSError, TypeError, ValueError):
+        return None
+    if not last:
+        return None
+    return {"turnId": last.get("turn_id"), "approvalPolicy": last.get("approval_policy"),
+            "sandbox": last.get("sandbox_policy")}
 
 
 def ensure_loaded(c, thread_id):
@@ -229,8 +266,9 @@ def new_thread(c, a, extra_config=None):
         params["config"] = overrides
     r = c.call("thread/start", params)
     tid = r["thread"]["id"]
-    if overrides:
-        save_overrides(tid, overrides)
+    # Record permissions so later turns and reloads keep them (see `resume` and `pinned_permissions`).
+    save_thread(tid, sandbox=a.sandbox, sandboxPolicy=r.get("sandbox"), approvalPolicy="never",
+                **({"config": overrides} if overrides else {}))
     if a.name:
         c.call("thread/name/set", {"threadId": tid, "name": a.name})
     return r, tid
@@ -271,7 +309,7 @@ def cmd_start(a):
     c = Client()
     r, tid = new_thread(c, a)
     prompt = sys.stdin.read() if a.prompt == "-" else a.prompt
-    tp = {"threadId": tid, "input": text_input(prompt), **turn_overrides(a)}
+    tp = {"threadId": tid, "input": text_input(prompt), **turn_overrides(a), **pinned_permissions(tid)}
     if a.summary:
         tp["summary"] = a.summary
     tr = c.call("turn/start", tp)
@@ -289,6 +327,8 @@ def cmd_status(a):
     last = turns[-1] if turns else {}
     return {"threadId": a.thread, "name": th.get("name"), "threadStatus": th.get("status"),
             "model": th.get("model"), "cwd": th.get("cwd"),
+            "pinnedSandbox": load_state().get(a.thread, {}).get("sandbox"),
+            "lastTurnPermissions": last_turn_sandbox(th.get("path")),
             "activeTurnId": last.get("id") if last.get("status") == "inProgress" else None,
             "lastTurn": {k: last.get(k) for k in ("id", "status", "error", "durationMs")} if last else None,
             "recent": [dict(turn=tid, **summarize_item(i, a.chars)) for tid, i in items],
@@ -432,14 +472,22 @@ def cmd_steer(a):
 
 def cmd_queue(a):
     c = Client()
+    if a.sandbox:
+        save_thread(a.thread, sandbox=a.sandbox, sandboxPolicy={"type": POLICY_TYPES[a.sandbox]},
+                    approvalPolicy="never")
     ensure_loaded(c, a.thread)
     deadline = time.time() + a.wait
     while active_turn_id(c, a.thread):
         if time.time() > deadline:
             raise CodexError(f"a turn is still active after {a.wait}s; use `steer`, `stop`, or retry")
         time.sleep(5)
-    tr = c.call("turn/start", {"threadId": a.thread, "input": text_input(a.message), **turn_overrides(a)})
-    return {"queued": True, "turnId": tr["turn"]["id"]}
+    pinned = pinned_permissions(a.thread)
+    tr = c.call("turn/start", {"threadId": a.thread, "input": text_input(a.message), **turn_overrides(a), **pinned})
+    out = {"queued": True, "turnId": tr["turn"]["id"], "sandbox": load_state().get(a.thread, {}).get("sandbox")}
+    if not pinned:
+        out["note"] = ("codexctl has no recorded sandbox for this thread, so the daemon's default applies; "
+                       "pass --sandbox to pin one")
+    return out
 
 
 def cmd_stop(a):
@@ -553,6 +601,8 @@ def build_parser():
     s.add_argument("thread")
     s.add_argument("message")
     s.add_argument("--wait", type=int, default=3600, help="max seconds to wait (default 3600)")
+    s.add_argument("--sandbox", choices=SANDBOXES,
+                   help="re-pin the thread's sandbox for this and later turns (default: the one recorded at start)")
     add_turn_flags(s)
 
     s = add("stop", cmd_stop, "interrupt the active turn")
