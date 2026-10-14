@@ -15,8 +15,8 @@ import time
 
 DEFAULT_SOCK = "~/.codex/app-server-control/app-server-control.sock"
 SANDBOXES = ["read-only", "workspace-write", "danger-full-access"]
-DEFAULT_SANDBOX = "workspace-write"
-DEFAULT_APPROVAL_POLICY = "on-request"
+DEFAULT_SANDBOX = "danger-full-access"
+DEFAULT_APPROVAL_POLICY = "never"
 DEFAULT_APPROVALS_REVIEWER = "auto_review"
 # thread/start and thread/resume take the mode; turn/start and responses use the policy object.
 POLICY_TYPES = {"read-only": "readOnly", "workspace-write": "workspaceWrite",
@@ -571,7 +571,7 @@ def build_parser():
 
     def add_permission_flags(s, policy=None, reviewer=None):
         s.add_argument("--ask-for-approval", default=policy, choices=["on-request", "never"],
-                       help="approval policy (default: " + (policy or "recorded policy, else on-request") + ")")
+                       help="approval policy (default: " + (policy or "recorded policy, else never") + ")")
         s.add_argument("--approvals-reviewer", default=reviewer, choices=["auto_review", "user"],
                        help="approval reviewer (default: " + (reviewer or "recorded reviewer, else auto_review") + ")")
 
@@ -624,7 +624,7 @@ def build_parser():
     s.add_argument("message")
     s.add_argument("--wait", type=int, default=3600, help="max seconds to wait (default 3600)")
     s.add_argument("--sandbox", choices=SANDBOXES,
-                   help="re-pin the thread's sandbox (default: recorded sandbox, else workspace-write)")
+                   help="re-pin the thread's sandbox (default: recorded sandbox, else danger-full-access)")
     add_permission_flags(s)
     add_turn_flags(s)
 
