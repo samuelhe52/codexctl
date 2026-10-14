@@ -429,5 +429,14 @@ class WaitTest(unittest.TestCase):
         self.assertEqual(out["turnId"], "u1")
 
 
+
+class ParseValueBoundaryTests(unittest.TestCase):
+    def test_empty_invalid_and_unicode_values_are_preserved(self):
+        # Config values that are not JSON must remain usable verbatim, including
+        # the empty value accepted by -c KEY= and non-ASCII text.
+        self.assertEqual(codexctl.parse_value(""), "")
+        self.assertEqual(codexctl.parse_value("not JSON: \u2603"), "not JSON: \u2603")
+        self.assertEqual(codexctl.parse_value('"\u2603"'), "\u2603")
+
 if __name__ == "__main__":
     unittest.main()
